@@ -8,6 +8,8 @@ s3 = boto3.client("s3")
 dynamodb = boto3.resource("dynamodb")
 TABLE = dynamodb.Table(os.environ["JOBS_TABLE"])
 BUCKET = os.environ["DATA_BUCKET"]
+MAX_RECEIVE_COUNT = 5  # Must match JobQueue.RedrivePolicy.maxReceiveCount in template.yaml.
+
 
 def update_job(job_id, status, **extra):
     names = {"#status": "status"}
@@ -26,6 +28,7 @@ def update_job(job_id, status, **extra):
         UpdateExpression="SET " + ", ".join(assignments),
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=values,
+        ConditionExpression="attribute_exists(jobId)",
     )
 
 
@@ -33,6 +36,7 @@ def lambda_handler(event, context):
     failures = []
     for record in event.get("Records", []):
         message_id = record.get("messageId")
+        job_id = None
         try:
             message = json.loads(record["body"])
             job_id, input_key = message["jobId"], message["inputKey"]
@@ -50,23 +54,22 @@ def lambda_handler(event, context):
                 job_id, "COMPLETED", resultKey=result_key,
                 resultSummary={"recordCount": result["recordCount"], "fieldCount": result["fieldCount"]},
             )
-       
         except Exception as exc:
             print("Job processing failed", {"messageId": message_id, "error": str(exc)})
-            try:
-                parsed = json.loads(record.get("body", "{}"))
-                job_id = parsed.get("jobId")
-                receive_count = int(
-                    (record.get("attributes") or {}).get(
-                        "ApproximateReceiveCount", "1"
-                    )
-                )
-                if job_id and receive_count >= 5:
-                    update_job(
-                        job_id,
-                        "FAILED",
-                        errorMessage="Processing failed after repeated attempts; inspect worker logs.",
-                    )
-            except Exception as update_exc:
-                print("Unable to update failed job", str(update_exc))
+            receive_count = int((record.get("attributes") or {}).get("ApproximateReceiveCount", "1"))
+            if job_id:
+                try:
+                    if receive_count >= MAX_RECEIVE_COUNT:
+                        update_job(
+                            job_id, "FAILED",
+                            errorMessage="Processing failed after repeated attempts; inspect worker logs.",
+                        )
+                    else:
+                        update_job(job_id, "RETRYING", retryCount=receive_count)
+                except Exception as update_exc:
+                    print("Unable to update failed job", {"jobId": job_id, "error": str(update_exc)})
             failures.append({"itemIdentifier": message_id})
+
+    # Required by the SQS event source's ReportBatchItemFailures setting.
+    # Omitting this response would acknowledge failed messages and prevent retries/DLQ redrive.
+    return {"batchItemFailures": failures}
