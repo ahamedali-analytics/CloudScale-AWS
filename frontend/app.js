@@ -9,6 +9,40 @@ function apiBase() {
   return value;
 }
 
+const POLL_INTERVAL_MS = 3000;
+const MAX_POLL_ATTEMPTS = 60;
+let pollTimer = null;
+let activeJobId = null;
+
+function stopPolling() {
+  if (pollTimer !== null) clearTimeout(pollTimer);
+  pollTimer = null;
+  activeJobId = null;
+}
+
+async function pollJob(jobId, attempts = 0) {
+  if (activeJobId !== jobId || $("jobId").value.trim() !== jobId) {
+    stopPolling();
+    return;
+  }
+  try {
+    const data = await checkJob();
+    if (data.status === "COMPLETED" || data.status === "FAILED") {
+      stopPolling();
+      return;
+    }
+    if (attempts + 1 >= MAX_POLL_ATTEMPTS) {
+      stopPolling();
+      $("jobStatus").textContent += " · Automatic checks stopped; use Check status to refresh.";
+      return;
+    }
+    pollTimer = setTimeout(() => pollJob(jobId, attempts + 1), POLL_INTERVAL_MS);
+  } catch (error) {
+    stopPolling();
+    $("jobStatus").textContent = error.message;
+  }
+}
+
 $("submitBtn").addEventListener("click", async () => {
   const button = $("submitBtn");
   const message = $("submitMessage");
@@ -24,9 +58,11 @@ $("submitBtn").addEventListener("click", async () => {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`);
+    stopPolling();
     $("jobId").value = data.jobId;
     message.textContent = `Job accepted: ${data.jobId} (${data.status})`;
-    await checkJob();
+    activeJobId = data.jobId;
+    await pollJob(data.jobId);
   } catch (error) {
     message.textContent = error.message;
   } finally {
@@ -47,6 +83,7 @@ async function checkJob() {
 }
 
 $("checkBtn").addEventListener("click", async () => {
+  stopPolling();
   $("jobStatus").textContent = "Checking…";
   try { await checkJob(); }
   catch (error) { $("jobStatus").textContent = error.message; $("result").hidden = true; }
